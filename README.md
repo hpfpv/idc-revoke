@@ -15,8 +15,9 @@ whose condition lists the revoked users (with a placeholder that matches
 nobody). Revoking someone is then adding one value to that list.
 
 The tool looks up the Identity Center user, adds their ID (or username)
-to every list you configured, removes their direct account assignments,
-and tells you what is left to do by hand.
+to every list you configured, removes their direct account assignments
+(so the portal stops offering the accounts; group assignments are
+reported, not removed), and tells you what is left to do by hand.
 
 ## Policies
 
@@ -77,6 +78,8 @@ A first test on yourself, in a sandbox:
    placeholder in it matches nobody).
 2. Copy `revoke.example.toml` to `revoke.toml` and fill in your identity
    store ID, instance ARN and the SCP's policy ID.
+   Set `remove_assignments = false`, or the tool will remove your own
+   account assignments.
 3. Run `--dry-run revoke <you>`, then `revoke <you>`: your session in that
    account is denied a few seconds later.
 4. Run `restore <you>` from a session the SCP does not cover (the
@@ -95,7 +98,7 @@ exactly these actions.
   `identitystore:ListGroupMembershipsForMember`,
   `identitystore:DescribeGroup`,
   `sso:ListAccountAssignmentsForPrincipal`.
-- With `remove_assignments = true`: `sso:DeleteAccountAssignment`.
+- Unless `remove_assignments = false`: `sso:DeleteAccountAssignment`.
 - For an `scp` list: `organizations:DescribePolicy`,
   `organizations:UpdatePolicy`.
 - For a `managed_policy` list, in the account that owns the policy:
@@ -114,7 +117,7 @@ identity_store_id = "d-xxxxxxxxxx"
 instance_arn = "arn:aws:sso:::instance/ssoins-xxxxxxxxxxxxxxxx"
 region = "ca-central-1"
 profile = "management"       # optional, default credentials otherwise
-remove_assignments = true    # direct assignments only, groups are reported
+remove_assignments = true    # the default; direct assignments only
 retention_hours = 12         # used to tell you when restore is safe
 
 [[deny_list]]
@@ -171,6 +174,9 @@ and `write(document)` methods and pass it as the store.
 
 ## What it does not do
 
+- Give assignments back: `restore` only empties the deny lists. The
+  assignments `revoke` removed are listed in its report, to recreate by
+  hand. Set `remove_assignments = false` to keep them.
 - End portal sessions or disable the user: there is no API.
 - Remove group memberships: they are listed in the report.
 - Find IAM users, keys or chained roles the person left behind.

@@ -124,13 +124,32 @@ def test_unknown_deny_list_type_is_rejected(sessions):
 def test_minimal_configuration_uses_defaults(sessions):
     config = {
         "identity_store_id": "d-1",
+        "instance_arn": "ins",
         "deny_list": [{"type": "scp", "policy_id": "p-1", "sid": "s"}],
     }
     revoker = cli.build_revoker(config, True, sessions)
     assert revoker.dry_run is True
-    assert revoker.remove_assignments is False
+    assert revoker.remove_assignments is True
     assert revoker.retention.total_seconds() == 12 * 3600
     assert sessions.created[0].kwargs == {}
+
+
+def test_removing_assignments_needs_the_instance_arn(sessions):
+    config = {
+        "identity_store_id": "d-1",
+        "deny_list": [{"type": "scp", "policy_id": "p-1", "sid": "s"}],
+    }
+    with pytest.raises(ValueError, match="instance_arn is needed"):
+        cli.build_revoker(config, False, sessions)
+
+
+def test_assignments_can_be_kept_without_an_instance_arn(sessions):
+    config = {
+        "identity_store_id": "d-1",
+        "remove_assignments": False,
+        "deny_list": [{"type": "scp", "policy_id": "p-1", "sid": "s"}],
+    }
+    assert cli.build_revoker(config, False, sessions).remove_assignments is False
 
 
 @pytest.mark.parametrize(

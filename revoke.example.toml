@@ -5,7 +5,7 @@ identity_store_id = "d-xxxxxxxxxx"
 instance_arn = "arn:aws:sso:::instance/ssoins-xxxxxxxxxxxxxxxx"
 region = "ca-central-1"
 profile = "management"       # optional, default credentials otherwise
-remove_assignments = true    # direct assignments only, groups are reported
+remove_assignments = true    # the default; direct assignments only
 retention_hours = 12         # used to tell you when restore is safe
 
 [[deny_list]]

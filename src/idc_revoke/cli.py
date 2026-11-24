@@ -96,6 +96,12 @@ def build_revoker(
         )
         for entry in config["deny_list"]
     ]
+    remove_assignments = config.get("remove_assignments", True)
+    if remove_assignments and not config.get("instance_arn"):
+        raise ValueError(
+            "instance_arn is needed to remove account assignments "
+            "(or set remove_assignments = false)"
+        )
     home = sessions.get()
     return Revoker(
         identitystore=home.client("identitystore"),
@@ -103,7 +109,7 @@ def build_revoker(
         deny_lists=deny_lists,
         sso_admin=home.client("sso-admin"),
         instance_arn=config.get("instance_arn"),
-        remove_assignments=config.get("remove_assignments", False),
+        remove_assignments=remove_assignments,
         retention=timedelta(hours=config.get("retention_hours", 12)),
         dry_run=dry_run,
     )
