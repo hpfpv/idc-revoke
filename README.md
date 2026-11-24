@@ -50,6 +50,44 @@ Before you deploy the guardrail:
 - If a pipeline owns your SCPs and reverts manual changes, edit the list
   in the permission sets and push the SCP change through the pipeline.
 
+## Management account
+
+SCPs do not apply to the management account, so a deny list in an SCP
+never blocks a session there. The deny list has to sit in the permission
+sets instead:
+
+1. In the management account, create a customer managed IAM policy from
+   `policies/deny-list.json`, for example `IdcRevokeDenyList`.
+2. In IAM Identity Center, add a customer managed policy reference with
+   that name to every permission set that is assigned on the management
+   account.
+3. Add the policy to your config:
+
+```toml
+[[deny_list]]
+type = "managed_policy"
+policy_arn = "arn:aws:iam::111111111111:policy/IdcRevokeDenyList"
+sid = "DenyRevokedIdentityCenterUsers"
+```
+
+The tool then edits that policy like any other list. A customer managed
+policy is read at each request, so the change needs no reprovisioning (in
+a sandbox account a session was blocked about 8 seconds later).
+
+Things to know:
+
+- A permission set that references the policy fails to provision in an
+  account where the policy does not exist. Create the policy in every
+  account the permission set is assigned to before you add the
+  reference.
+- The deny matches one user ID, so other people on the same permission
+  set are not affected. It does mean you can revoke yourself: run the
+  tool as someone else, or from a permission set that does not reference
+  the list.
+- The `inline_policy` type works too, without a separate IAM policy, but
+  each change reprovisions the permission set (about 12 seconds in the
+  management account).
+
 ## Install and run
 
 ```bash
