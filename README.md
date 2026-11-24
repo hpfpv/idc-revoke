@@ -61,7 +61,53 @@ uv run idc-revoke --config revoke.toml restore jane@example.com
 
 `restore` accepts `--user-id` for a user deleted since the revocation.
 
+## Try it without risk
+
+Three things make a first run safe:
+
+- `--dry-run` reads everything and changes nothing. The report shows what
+  it would add to each list.
+- `status` only reads: it tells you, list by list, whether the user is in
+  it.
+- `restore` puts the lists back the way they were.
+
+A first test on yourself, in a sandbox:
+
+1. Deploy `policies/deny-list.json` as an SCP on one sandbox account (the
+   placeholder in it matches nobody).
+2. Copy `revoke.example.toml` to `revoke.toml` and fill in your identity
+   store ID, instance ARN and the SCP's policy ID.
+3. Run `--dry-run revoke <you>`, then `revoke <you>`: your session in that
+   account is denied a few seconds later.
+4. Run `restore <you>` from a session the SCP does not cover (the
+   management account), and your access comes back.
+
+Do not test on your only way in: the SCP must not cover the session you
+run the tool from.
+
+## Permissions the tool needs
+
+This list comes from the API calls in the code. I ran the tool as an
+administrator, so it has not been checked against a role limited to
+exactly these actions.
+
+- Always: `identitystore:GetUserId`,
+  `identitystore:ListGroupMembershipsForMember`,
+  `identitystore:DescribeGroup`,
+  `sso:ListAccountAssignmentsForPrincipal`.
+- With `remove_assignments = true`: `sso:DeleteAccountAssignment`.
+- For an `scp` list: `organizations:DescribePolicy`,
+  `organizations:UpdatePolicy`.
+- For a `managed_policy` list, in the account that owns the policy:
+  `iam:GetPolicy`, `iam:GetPolicyVersion`, `iam:ListPolicyVersions`,
+  `iam:CreatePolicyVersion`, `iam:DeletePolicyVersion` (and
+  `sts:AssumeRole` if you give a `role_arn`).
+- For an `inline_policy` list: `sso:GetInlinePolicyForPermissionSet`,
+  `sso:PutInlinePolicyToPermissionSet`, `sso:ProvisionPermissionSet`.
+
 ## Configuration
+
+`revoke.example.toml` is a copy of this block to start from.
 
 ```toml
 identity_store_id = "d-xxxxxxxxxx"

@@ -2,9 +2,11 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError, NoCredentialsError
 
 from idc_revoke import cli
-from idc_revoke.core import DenyList, RevokeReport, User
+from idc_revoke.core import DenyList, RevokeReport, User, UserNotFoundError
+from idc_revoke.policy import StatementNotFoundError
 from idc_revoke.stores import InlinePolicyStore, ManagedPolicyStore, ScpStore
 
 CONFIG = """
@@ -172,3 +174,47 @@ def test_deny_list_is_exported_for_module_users():
 
     assert idc_revoke.DenyList is DenyList
     assert idc_revoke.ScpStore is ScpStore
+
+
+def test_missing_config_file_is_a_clean_error(tmp_path, capsys):
+    code = cli.main(["--config", str(tmp_path / "nope.toml"), "status", "jane"])
+    assert code == 1
+    error = capsys.readouterr().err
+    assert error.startswith("idc-revoke: cannot read the config file")
+    assert "Traceback" not in error
+
+
+def test_invalid_config_file_is_a_clean_error(tmp_path, capsys):
+    path = tmp_path / "revoke.toml"
+    path.write_text("deny_list = [")
+    assert cli.main(["--config", str(path), "status", "jane"]) == 1
+    assert capsys.readouterr().err.startswith(
+        "idc-revoke: the config file is not valid TOML"
+    )
+
+
+@pytest.mark.parametrize(
+    ("raised", "message"),
+    [
+        (KeyError("identity_store_id"), "missing setting: identity_store_id"),
+        (UserNotFoundError("jane"), "no Identity Center user named jane"),
+        (StatementNotFoundError("no statement 'x'"), "no statement 'x'"),
+        (ValueError("unknown deny list type: x"), "unknown deny list type: x"),
+        (
+            ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "Op"),
+            "AWS error: An error occurred (AccessDenied)",
+        ),
+        (NoCredentialsError(), "AWS error: Unable to locate credentials"),
+    ],
+)
+def test_expected_failures_are_clean_errors(
+    config_file, monkeypatch, capsys, raised, message
+):
+    def fail(*args, **kwargs):
+        raise raised
+
+    monkeypatch.setattr(cli, "build_revoker", fail)
+    assert cli.main(["--config", str(config_file), "revoke", "jane"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith(f"idc-revoke: {message}")
+    assert captured.out == ""

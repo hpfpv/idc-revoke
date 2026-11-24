@@ -1,0 +1,32 @@
+# Copy to revoke.toml (ignored by git) and replace the placeholders.
+# Keep only the [[deny_list]] entries you have deployed.
+
+identity_store_id = "d-xxxxxxxxxx"
+instance_arn = "arn:aws:sso:::instance/ssoins-xxxxxxxxxxxxxxxx"
+region = "ca-central-1"
+profile = "management"       # optional, default credentials otherwise
+remove_assignments = true    # direct assignments only, groups are reported
+retention_hours = 12         # used to tell you when restore is safe
+
+[[deny_list]]
+type = "scp"
+policy_id = "p-xxxxxxxx"
+sid = "DenyRevokedIdentityCenterUsers"
+
+[[deny_list]]                # same SCP, second list for chained sessions
+type = "scp"
+policy_id = "p-xxxxxxxx"
+sid = "DenyRevokedSourceIdentities"
+key = "aws:SourceIdentity"
+template = "{user_name}"
+
+[[deny_list]]
+type = "managed_policy"
+policy_arn = "arn:aws:iam::111111111111:policy/DenyList"
+role_arn = "arn:aws:iam::111111111111:role/SomeAdminRole"  # or profile = "..."
+sid = "DenyRevokedIdentityCenterUsers"
+
+[[deny_list]]
+type = "inline_policy"
+permission_set_arn = "arn:aws:sso:::permissionSet/ssoins-xxx/ps-xxx"
+sid = "DenyRevokedIdentityCenterUsers"

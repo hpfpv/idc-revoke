@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 import tomllib
 from collections.abc import Callable
 from datetime import timedelta
@@ -9,8 +10,9 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
-from idc_revoke.core import DenyList, Revoker
+from idc_revoke.core import DenyList, Revoker, UserNotFoundError
 from idc_revoke.stores import (
     DenyListStore,
     InlinePolicyStore,
@@ -118,13 +120,37 @@ def main(argv: list[str] | None = None) -> int:
         if name == "restore":
             command.add_argument("--user-id", help="needed if the user was deleted")
     args = parser.parse_args(argv)
-
-    revoker = build_revoker(load_config(args.config), args.dry_run)
-    if args.command == "revoke":
-        result = revoker.revoke(args.user_name).to_dict()
-    elif args.command == "restore":
-        result = revoker.restore(args.user_name, args.user_id).to_dict()
-    else:
-        result = revoker.status(args.user_name)
+    try:
+        result = _run(args)
+    except EXPECTED_ERRORS as error:
+        print(f"idc-revoke: {_explain(error)}", file=sys.stderr)
+        return 1
     print(json.dumps(result, indent=2))
     return 0
+
+
+EXPECTED_ERRORS = (OSError, ValueError, LookupError, BotoCoreError, ClientError)
+
+
+def _explain(error: Exception) -> str:
+    """One line a person can act on, in place of a traceback."""
+    if isinstance(error, tomllib.TOMLDecodeError):
+        return f"the config file is not valid TOML: {error}"
+    if isinstance(error, OSError):
+        return f"cannot read the config file: {error}"
+    if isinstance(error, UserNotFoundError):
+        return f"no Identity Center user named {error}"
+    if isinstance(error, KeyError):
+        return f"missing setting: {error.args[0]}"
+    if isinstance(error, BotoCoreError | ClientError):
+        return f"AWS error: {error}"
+    return str(error)
+
+
+def _run(args: argparse.Namespace) -> Any:
+    revoker = build_revoker(load_config(args.config), args.dry_run)
+    if args.command == "revoke":
+        return revoker.revoke(args.user_name).to_dict()
+    if args.command == "restore":
+        return revoker.restore(args.user_name, args.user_id).to_dict()
+    return revoker.status(args.user_name)
