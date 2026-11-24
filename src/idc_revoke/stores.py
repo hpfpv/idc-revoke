@@ -5,10 +5,17 @@ giving it a ``name`` and ``read`` and ``write`` methods.
 """
 
 import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from idc_revoke.policy import Document
+
+
+def compact(document: Document) -> str:
+    """The policy as AWS should store it: whitespace counts toward SCP limits."""
+    return json.dumps(document, separators=(",", ":"))
 
 
 class DenyListStore(Protocol):
@@ -30,6 +37,8 @@ class ScpStore:
 
     client: Any  # boto3 "organizations" client
     policy_id: str
+    # https://docs.aws.amazon.com/organizations/latest/userguide/orgs_reference_limits.html
+    max_size: int = 10240
 
     @property
     def name(self) -> str:
@@ -40,7 +49,7 @@ class ScpStore:
         return json.loads(policy["Policy"]["Content"])
 
     def write(self, document: Document) -> None:
-        self.client.update_policy(PolicyId=self.policy_id, Content=json.dumps(document))
+        self.client.update_policy(PolicyId=self.policy_id, Content=compact(document))
 
 
 @dataclass
@@ -55,6 +64,7 @@ class ManagedPolicyStore:
     client: Any  # boto3 "iam" client for the account that holds the policy
     policy_arn: str
     max_versions: int = 5
+    max_size: int = 6144
 
     @property
     def name(self) -> str:
@@ -80,7 +90,7 @@ class ManagedPolicyStore:
             )
         self.client.create_policy_version(
             PolicyArn=self.policy_arn,
-            PolicyDocument=json.dumps(document),
+            PolicyDocument=compact(document),
             SetAsDefault=True,
         )
 
@@ -90,13 +100,16 @@ class InlinePolicyStore:
     """The inline policy of one permission set.
 
     A change does nothing until the permission set is reprovisioned, so this
-    store reprovisions on write unless told not to.
+    store reprovisions on write unless told not to, and waits for the result.
     """
 
     client: Any  # boto3 "sso-admin" client
     instance_arn: str
     permission_set_arn: str
     provision: bool = True
+    sleep: Callable[[float], None] = time.sleep
+    attempts: int = 60
+    interval: float = 2.0
 
     @property
     def name(self) -> str:
@@ -106,17 +119,35 @@ class InlinePolicyStore:
         policy = self.client.get_inline_policy_for_permission_set(
             InstanceArn=self.instance_arn, PermissionSetArn=self.permission_set_arn
         )
-        return json.loads(policy["InlinePolicy"])
+        text = policy.get("InlinePolicy") or ""
+        if not text.strip():
+            raise ValueError("the permission set has no inline policy")
+        return json.loads(text)
 
     def write(self, document: Document) -> None:
         self.client.put_inline_policy_to_permission_set(
             InstanceArn=self.instance_arn,
             PermissionSetArn=self.permission_set_arn,
-            InlinePolicy=json.dumps(document),
+            InlinePolicy=compact(document),
         )
-        if self.provision:
-            self.client.provision_permission_set(
+        if not self.provision:
+            return
+        started = self.client.provision_permission_set(
+            InstanceArn=self.instance_arn,
+            PermissionSetArn=self.permission_set_arn,
+            TargetType="ALL_PROVISIONED_ACCOUNTS",
+        )
+        request_id = started["PermissionSetProvisioningStatus"]["RequestId"]
+        for attempt in range(self.attempts):
+            status = self.client.describe_permission_set_provisioning_status(
                 InstanceArn=self.instance_arn,
-                PermissionSetArn=self.permission_set_arn,
-                TargetType="ALL_PROVISIONED_ACCOUNTS",
-            )
+                ProvisionPermissionSetRequestId=request_id,
+            )["PermissionSetProvisioningStatus"]
+            if status["Status"] == "SUCCEEDED":
+                return
+            if status["Status"] != "IN_PROGRESS":
+                reason = status.get("FailureReason", "no reason given")
+                raise RuntimeError(f"provisioning {status['Status']}: {reason}")
+            if attempt < self.attempts - 1:
+                self.sleep(self.interval)
+        raise RuntimeError("provisioning still in progress, check it in the console")

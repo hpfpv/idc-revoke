@@ -4,7 +4,13 @@ from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
 
-from idc_revoke.core import DenyList, Revoker, User, UserNotFoundError
+from idc_revoke.core import (
+    DenyList,
+    PreflightError,
+    Revoker,
+    User,
+    UserNotFoundError,
+)
 from idc_revoke.policy import list_values
 
 SID = "DenyRevoked"
@@ -33,6 +39,7 @@ def make_identitystore(found=True):
     client = MagicMock()
     if found:
         client.get_user_id.return_value = {"UserId": "u-1"}
+        client.describe_user.return_value = {"UserName": "jane"}
     else:
         client.get_user_id.side_effect = ClientError(
             {"Error": {"Code": "ResourceNotFoundException", "Message": "no"}},
@@ -50,6 +57,12 @@ def make_identitystore(found=True):
 
 def make_sso_admin():
     client = MagicMock()
+    client.delete_account_assignment.side_effect = lambda **kw: {
+        "AccountAssignmentDeletionStatus": {"RequestId": f"r-{kw['TargetId']}"}
+    }
+    client.describe_account_assignment_deletion_status.return_value = {
+        "AccountAssignmentDeletionStatus": {"Status": "SUCCEEDED"}
+    }
     client.list_account_assignments_for_principal.side_effect = [
         {
             "AccountAssignments": [{"AccountId": "111", "PermissionSetArn": "ps-a"}],
@@ -210,3 +223,130 @@ def test_report_converts_to_plain_data():
     assert data["restore_after"] == "2026-11-19T03:00:00+00:00"
     revoker.identitystore.list_group_memberships_for_member.side_effect = None
     assert revoker.restore("jane").to_dict()["restore_after"] is None
+
+
+def test_the_user_name_is_the_one_identity_center_stores():
+    revoker, _, names = make_revoker()
+    report = revoker.revoke("JANE")
+    assert report.user == User("u-1", "jane")
+    assert "*:jane" in values(names, "aws:userid")
+
+
+def test_a_list_that_cannot_be_edited_stops_everything_before_any_write():
+    revoker, ids, names = make_revoker()
+    revoker.deny_lists[1].sid = "Missing"
+    with pytest.raises(PreflightError, match="nothing was changed: names/Missing"):
+        revoker.revoke("jane")
+    assert (ids.writes, names.writes) == (0, 0)
+
+
+def test_an_unknown_placeholder_in_a_template_stops_before_any_write():
+    revoker, ids, _ = make_revoker()
+    revoker.deny_lists[1].template = "*:{username}"
+    with pytest.raises(PreflightError, match="unknown placeholder"):
+        revoker.revoke("jane")
+    assert ids.writes == 0
+
+
+def test_a_policy_that_would_be_too_long_stops_before_any_write():
+    revoker, ids, names = make_revoker(dry_run=True)
+    names.max_size = 20
+    with pytest.raises(PreflightError, match="over the limit of 20"):
+        revoker.revoke("jane")
+    assert ids.writes == 0
+
+
+def test_a_failed_write_is_reported_and_the_other_lists_are_still_written():
+    revoker, ids, names = make_revoker()
+    ids.write = MagicMock(
+        side_effect=ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "UpdatePolicy"
+        )
+    )
+    report = revoker.revoke("jane")
+    assert report.changed == ["names/DenyRevoked"]
+    assert len(report.failed) == 1
+    assert report.failed[0].startswith("ids/DenyRevoked: ")
+    assert "*:jane" in values(names, "aws:userid")
+
+
+def test_assignments_held_through_a_group_are_reported_not_removed():
+    sso_admin = make_sso_admin()
+    sso_admin.list_account_assignments_for_principal.side_effect = [
+        {
+            "AccountAssignments": [
+                {
+                    "AccountId": "111",
+                    "PermissionSetArn": "ps-a",
+                    "PrincipalType": "GROUP",
+                },
+                {
+                    "AccountId": "222",
+                    "PermissionSetArn": "ps-b",
+                    "PrincipalType": "USER",
+                },
+            ]
+        }
+    ]
+    revoker, _, _ = make_revoker(
+        sso_admin=sso_admin, instance_arn="ins", remove_assignments=True
+    )
+    report = revoker.revoke("jane")
+    assert report.removed_assignments == ["222/ps-b"]
+    assert report.inherited_assignments == ["111/ps-a"]
+    assert sso_admin.delete_account_assignment.call_count == 1
+
+
+def test_a_failed_assignment_removal_does_not_lose_the_others():
+    sso_admin = make_sso_admin()
+    denied = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "Op")
+
+    def delete(**kw):
+        if kw["TargetId"] == "111":
+            raise denied
+        return {"AccountAssignmentDeletionStatus": {"RequestId": "r-222"}}
+
+    sso_admin.delete_account_assignment.side_effect = delete
+    revoker, _, _ = make_revoker(
+        sso_admin=sso_admin, instance_arn="ins", remove_assignments=True
+    )
+    report = revoker.revoke("jane")
+    assert report.removed_assignments == ["222/ps-b"]
+    assert report.failed[0].startswith("assignment 111/ps-a: ")
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (["IN_PROGRESS", "SUCCEEDED"], None),
+        (["FAILED"], "assignment 111/ps-a: FAILED: boom"),
+        (["IN_PROGRESS"] * 3, "assignment 111/ps-a: still in progress"),
+    ],
+)
+def test_an_assignment_counts_as_removed_only_when_the_deletion_succeeds(
+    statuses, expected
+):
+    sso_admin = make_sso_admin()
+    sso_admin.list_account_assignments_for_principal.side_effect = [
+        {"AccountAssignments": [{"AccountId": "111", "PermissionSetArn": "ps-a"}]}
+    ]
+    sso_admin.describe_account_assignment_deletion_status.side_effect = [
+        {"AccountAssignmentDeletionStatus": {"Status": s, "FailureReason": "boom"}}
+        for s in statuses
+    ]
+    naps = []
+    revoker, _, _ = make_revoker(
+        sso_admin=sso_admin,
+        instance_arn="ins",
+        remove_assignments=True,
+        sleep=naps.append,
+        poll_attempts=3,
+    )
+    report = revoker.revoke("jane")
+    if expected is None:
+        assert report.removed_assignments == ["111/ps-a"]
+        assert report.failed == []
+        assert len(naps) == 1
+    else:
+        assert report.removed_assignments == []
+        assert report.failed == [expected]

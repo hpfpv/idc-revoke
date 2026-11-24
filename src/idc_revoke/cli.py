@@ -21,9 +21,69 @@ from idc_revoke.stores import (
 )
 
 
+class ConfigError(ValueError):
+    """The config file cannot be read or holds a mistake."""
+
+
+TOP_LEVEL = {
+    "identity_store_id",
+    "instance_arn",
+    "region",
+    "profile",
+    "remove_assignments",
+    "retention_hours",
+    "deny_list",
+}
+ENTRY_COMMON = {"type", "sid", "key", "operator", "template", "profile", "role_arn"}
+ENTRY_OWN = {
+    "scp": {"policy_id"},
+    "managed_policy": {"policy_arn"},
+    "inline_policy": {"permission_set_arn", "provision"},
+}
+ENTRY_NEEDS = {
+    "scp": "policy_id",
+    "managed_policy": "policy_arn",
+    "inline_policy": "permission_set_arn",
+}
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
-    with open(path, "rb") as handle:
-        return tomllib.load(handle)
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except OSError as error:
+        raise ConfigError(f"cannot read the config file: {error}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(f"the config file is not valid TOML: {error}") from error
+
+
+def validate_config(config: dict[str, Any]) -> None:
+    """Refuse a config with a typo: a setting ignored in silence is a risk."""
+    for key in config:
+        if key not in TOP_LEVEL:
+            raise ConfigError(f"unknown setting: {key}")
+    if not config.get("identity_store_id"):
+        raise ConfigError("missing setting: identity_store_id")
+    if not isinstance(config.get("remove_assignments", True), bool):
+        raise ConfigError("remove_assignments must be true or false")
+    hours = config.get("retention_hours", 12)
+    if isinstance(hours, bool) or not isinstance(hours, int | float):
+        raise ConfigError("retention_hours must be a number")
+    entries = config.get("deny_list")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("the config needs at least one [[deny_list]]")
+    for number, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"deny_list {number} must be a table")
+        kind = entry.get("type")
+        if kind not in ENTRY_OWN:
+            raise ConfigError(f"unknown deny list type: {kind}")
+        for key in entry:
+            if key not in ENTRY_COMMON | ENTRY_OWN[kind]:
+                raise ConfigError(f"unknown setting in deny_list {number}: {key}")
+        for needed in ("sid", ENTRY_NEEDS[kind]):
+            if not entry.get(needed):
+                raise ConfigError(f"deny_list {number} ({kind}) needs {needed}")
 
 
 class _Sessions:
@@ -69,14 +129,12 @@ def _store(
         return ScpStore(session.client("organizations"), entry["policy_id"])
     if kind == "managed_policy":
         return ManagedPolicyStore(session.client("iam"), entry["policy_arn"])
-    if kind == "inline_policy":
-        return InlinePolicyStore(
-            session.client("sso-admin"),
-            config["instance_arn"],
-            entry["permission_set_arn"],
-            entry.get("provision", True),
-        )
-    raise ValueError(f"unknown deny list type: {kind}")
+    return InlinePolicyStore(
+        session.client("sso-admin"),
+        config["instance_arn"],
+        entry["permission_set_arn"],
+        entry.get("provision", True),
+    )
 
 
 def build_revoker(
@@ -85,6 +143,7 @@ def build_revoker(
     session_factory: Callable[..., Any] = boto3.Session,
 ) -> Revoker:
     """Turn a configuration (see README) into a ready ``Revoker``."""
+    validate_config(config)
     sessions = _Sessions(config, session_factory)
     deny_lists = [
         DenyList(
@@ -132,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"idc-revoke: {_explain(error)}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))
+    failed = result.get("failed") or []
+    if failed:
+        steps = "1 step" if len(failed) == 1 else f"{len(failed)} steps"
+        print(f'idc-revoke: {steps} failed, see "failed" above', file=sys.stderr)
+        return 1
     return 0
 
 
@@ -140,10 +204,6 @@ EXPECTED_ERRORS = (OSError, ValueError, LookupError, BotoCoreError, ClientError)
 
 def _explain(error: Exception) -> str:
     """One line a person can act on, in place of a traceback."""
-    if isinstance(error, tomllib.TOMLDecodeError):
-        return f"the config file is not valid TOML: {error}"
-    if isinstance(error, OSError):
-        return f"cannot read the config file: {error}"
     if isinstance(error, UserNotFoundError):
         return f"no Identity Center user named {error}"
     if isinstance(error, KeyError):

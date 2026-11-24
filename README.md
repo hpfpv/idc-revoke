@@ -19,6 +19,16 @@ to every list you configured, removes their direct account assignments
 (so the portal stops offering the accounts; group assignments are
 reported, not removed), and tells you what is left to do by hand.
 
+It is built to be run under pressure:
+
+- Every list is read and checked before anything is written. A wrong
+  `sid`, a policy that would grow past its size limit or an AWS error
+  stops the run with "nothing was changed".
+- If a write then fails, the other lists are still written. The report
+  lists what changed and what failed, and the exit code is 1.
+- An assignment counts as removed, and an inline policy as changed, only
+  once AWS confirms it.
+
 ## Policies
 
 `policies/` holds the deny lists to deploy first, as an SCP or inside
@@ -41,12 +51,17 @@ Before you deploy the guardrail:
 - Every role people chain into must allow `sts:SetSourceIdentity` in its
   trust policy, and callers must pass `--source-identity` (there is no
   CLI profile setting for it). Without that, the chain is refused.
+- That refusal covers every `sts:AssumeRole` made from an Identity Center
+  session: the console's Switch Role, and tools that assume a role for
+  you (deployment roles, for example), stop working until they set a
+  source identity.
 - The guardrail statements match every Identity Center role
   (`aws-reserved/sso.amazonaws.com/*`). They were tested with that
   pattern narrowed to a few permission sets, not on a full landing zone.
   Narrow it the same way to roll it out gradually.
 - SCPs do not apply to the management account. Put the deny list in the
-  permission sets used there.
+  permission sets used there. The guardrail and the source identity list
+  do not cover sessions in the management account either.
 - If a pipeline owns your SCPs and reverts manual changes, edit the list
   in the permission sets and push the SCP change through the pipeline.
 
@@ -132,11 +147,13 @@ This list comes from the API calls in the code. I ran the tool as an
 administrator, so it has not been checked against a role limited to
 exactly these actions.
 
-- Always: `identitystore:GetUserId`,
+- Always: `identitystore:GetUserId`, `identitystore:DescribeUser`,
   `identitystore:ListGroupMembershipsForMember`,
-  `identitystore:DescribeGroup`,
-  `sso:ListAccountAssignmentsForPrincipal`.
-- Unless `remove_assignments = false`: `sso:DeleteAccountAssignment`.
+  `identitystore:DescribeGroup`.
+- Unless `remove_assignments = false`:
+  `sso:ListAccountAssignmentsForPrincipal`,
+  `sso:DeleteAccountAssignment`,
+  `sso:DescribeAccountAssignmentDeletionStatus`.
 - For an `scp` list: `organizations:DescribePolicy`,
   `organizations:UpdatePolicy`.
 - For a `managed_policy` list, in the account that owns the policy:
@@ -144,7 +161,8 @@ exactly these actions.
   `iam:CreatePolicyVersion`, `iam:DeletePolicyVersion` (and
   `sts:AssumeRole` if you give a `role_arn`).
 - For an `inline_policy` list: `sso:GetInlinePolicyForPermissionSet`,
-  `sso:PutInlinePolicyToPermissionSet`, `sso:ProvisionPermissionSet`.
+  `sso:PutInlinePolicyToPermissionSet`, `sso:ProvisionPermissionSet`,
+  `sso:DescribePermissionSetProvisioningStatus`.
 
 ## Configuration
 
@@ -186,6 +204,18 @@ Each deny list takes `sid`, and optionally `key` (default
 `identitystore:UserId`), `operator` (default `StringEquals`) and
 `template` (default `{user_id}`; `{user_name}` is also available).
 
+A list can also take `profile` or `role_arn` when its policy is in
+another account, and an `inline_policy` list takes `provision = false`
+to skip reprovisioning.
+
+A customer managed policy exists once per account. If you created it in
+ten accounts, the config needs ten `managed_policy` entries, each with
+the `profile` or `role_arn` that reaches its account. An account without
+an entry is not covered.
+
+A setting the tool does not know, or a value of the wrong type, stops
+the run: a typo in `remove_assignments` must not go unnoticed.
+
 ## Use as a module
 
 ```python
@@ -218,8 +248,27 @@ and `write(document)` methods and pass it as the store.
 - End portal sessions or disable the user: there is no API.
 - Remove group memberships: they are listed in the report.
 - Find IAM users, keys or chained roles the person left behind.
-- Schedule its own clean-up: run `restore` after the longest session
-  duration.
+- Schedule its own clean-up: run `restore` yourself. Do it only once
+  the user is disabled, their portal session has ended, their
+  assignments and group memberships are gone, and the longest session
+  duration has passed. Before that, the portal can hand them fresh
+  credentials the moment they leave the list.
+
+## Known limits
+
+- With the source identity guardrail deployed, a `role_arn` in the
+  config is refused when the tool runs from an Identity Center session
+  in a member account, because the tool does not set a source identity
+  on that hop. It fails before changing anything. Run it from the
+  management account, or use a `profile` per account.
+- Two people running the tool at the same moment on the same policy can
+  overwrite each other: the last write wins. Run `status` afterwards.
+- The AWS documentation says the listing of a user's assignments must be
+  called from the management account. Running from a delegated
+  administrator account was not tested.
+- Usernames are matched without regard to case when the user is looked
+  up, and the tool then uses the exact username Identity Center stores.
+  The lists on a username are case sensitive.
 
 ## Develop
 

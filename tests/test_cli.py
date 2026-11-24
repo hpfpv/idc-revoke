@@ -237,3 +237,60 @@ def test_expected_failures_are_clean_errors(
     captured = capsys.readouterr()
     assert captured.err.startswith(f"idc-revoke: {message}")
     assert captured.out == ""
+
+
+BASE = {
+    "identity_store_id": "d-1",
+    "instance_arn": "ins",
+    "deny_list": [{"type": "scp", "policy_id": "p-1", "sid": "s"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"remove_assignment": False}, "unknown setting: remove_assignment"),
+        ({"remove_assignments": "false"}, "remove_assignments must be true or false"),
+        ({"retention_hours": "12"}, "retention_hours must be a number"),
+        ({"deny_list": []}, "at least one"),
+        ({"deny_list": [{"type": "scp", "sid": "s"}]}, "needs policy_id"),
+        (
+            {"deny_list": [{"type": "scp", "policy_id": "p", "sid": "s", "side": 1}]},
+            "unknown setting in deny_list 1: side",
+        ),
+        ({"deny_list": [{"type": "scp", "policy_id": "p"}]}, "needs sid"),
+        ({"deny_list": ["scp"]}, "deny_list 1 must be a table"),
+        ({"identity_store_id": None}, "missing setting: identity_store_id"),
+    ],
+)
+def test_mistakes_in_the_configuration_are_rejected(sessions, change, message):
+    config = {**BASE, **change}
+    config = {key: value for key, value in config.items() if value is not None}
+    with pytest.raises(ValueError, match=message):
+        cli.build_revoker(config, False, sessions)
+    assert sessions.created == []
+
+
+def test_a_failed_step_prints_the_report_and_exits_with_an_error(
+    config_file, monkeypatch, capsys
+):
+    revoker = MagicMock()
+    report = RevokeReport(User("u-1", "jane"), "revoke", False)
+    report.failed.append("scp:p-1/DenyIds: boom")
+    revoker.revoke.return_value = report
+    monkeypatch.setattr(cli, "build_revoker", lambda *a, **k: revoker)
+    assert cli.main(["--config", str(config_file), "revoke", "jane"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["failed"] == ["scp:p-1/DenyIds: boom"]
+    assert "1 step failed" in captured.err
+
+
+def test_a_network_error_is_not_blamed_on_the_config_file(
+    config_file, monkeypatch, capsys
+):
+    def fail(*args, **kwargs):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(cli, "build_revoker", fail)
+    assert cli.main(["--config", str(config_file), "revoke", "jane"]) == 1
+    assert capsys.readouterr().err.startswith("idc-revoke: connection reset")

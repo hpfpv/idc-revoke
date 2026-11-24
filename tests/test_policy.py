@@ -1,4 +1,6 @@
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
@@ -82,3 +84,19 @@ def test_single_statement_object_is_supported():
 def test_missing_statement_operator_or_key_raises(sid, operator, key):
     with pytest.raises(StatementNotFoundError):
         add_value(make_doc(), sid, operator, key, "x")
+
+
+@pytest.mark.parametrize(
+    "path", sorted((Path(__file__).parent.parent / "policies").glob("*.json"))
+)
+def test_shipped_policies_work_with_the_default_settings(path):
+    document = json.loads(path.read_text())
+    sid, operator, key = (
+        "DenyRevokedIdentityCenterUsers",
+        "StringEquals",
+        "identitystore:UserId",
+    )
+    assert len(list_values(document, sid, operator, key)) == 1
+    added = add_value(document, sid, operator, key, "u-1")
+    assert "u-1" in list_values(added, sid, operator, key)
+    assert len(json.dumps(added, separators=(",", ":"))) < 5000

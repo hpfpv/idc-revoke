@@ -1,14 +1,15 @@
 """Revoke and restore one IAM Identity Center user through deny lists."""
 
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from idc_revoke.policy import Document, add_value, list_values, remove_value
-from idc_revoke.stores import DenyListStore
+from idc_revoke.stores import DenyListStore, compact
 
 MANUAL_STEPS = [
     "End the user's sessions in the Identity Center console (Active sessions).",
@@ -23,6 +24,10 @@ MANUAL_STEPS = [
 
 class UserNotFoundError(LookupError):
     """No Identity Center user has that user name."""
+
+
+class PreflightError(ValueError):
+    """A deny list cannot be edited. Raised before anything is written."""
 
 
 @dataclass(frozen=True)
@@ -51,7 +56,13 @@ class DenyList:
         return f"{self.store.name}/{self.sid}"
 
     def value_for(self, user: User) -> str:
-        return self.template.format(user_id=user.user_id, user_name=user.user_name)
+        try:
+            return self.template.format(user_id=user.user_id, user_name=user.user_name)
+        except (KeyError, IndexError) as error:
+            raise ValueError(
+                f"unknown placeholder in template {self.template!r} "
+                "(use {user_id} or {user_name})"
+            ) from error
 
     def holds(self, document: Document, user: User) -> bool:
         values = list_values(document, self.sid, self.operator, self.key)
@@ -75,7 +86,9 @@ class RevokeReport:
     dry_run: bool
     changed: list[str] = field(default_factory=list)
     unchanged: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
     removed_assignments: list[str] = field(default_factory=list)
+    inherited_assignments: list[str] = field(default_factory=list)
     groups: list[str] = field(default_factory=list)
     restore_after: datetime | None = None
     manual_steps: list[str] = field(default_factory=list)
@@ -105,6 +118,9 @@ class Revoker:
         retention: timedelta = timedelta(hours=12),
         dry_run: bool = False,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        sleep: Callable[[float], None] = time.sleep,
+        poll_attempts: int = 40,
+        poll_interval: float = 1.5,
     ) -> None:
         self.identitystore = identitystore
         self.identity_store_id = identity_store_id
@@ -115,6 +131,9 @@ class Revoker:
         self.retention = retention
         self.dry_run = dry_run
         self.clock = clock
+        self.sleep = sleep
+        self.poll_attempts = poll_attempts
+        self.poll_interval = poll_interval
 
     def find_user(self, user_name: str) -> User:
         try:
@@ -131,7 +150,11 @@ class Revoker:
             if error.response["Error"]["Code"] == "ResourceNotFoundException":
                 raise UserNotFoundError(user_name) from error
             raise
-        return User(found["UserId"], user_name)
+        # GetUserId ignores case, but the lists on the user name do not.
+        described = self.identitystore.describe_user(
+            IdentityStoreId=self.identity_store_id, UserId=found["UserId"]
+        )
+        return User(found["UserId"], described.get("UserName") or user_name)
 
     def revoke(self, user_name: str) -> RevokeReport:
         """Deny the user everywhere, then optionally remove assignments."""
@@ -139,7 +162,7 @@ class Revoker:
         report = RevokeReport(user, "revoke", self.dry_run)
         self._apply(report, add=True)
         if self.remove_assignments:
-            report.removed_assignments = self._remove_assignments(user)
+            self._remove_assignments(user, report)
         report.groups = self._group_names(user)
         report.restore_after = self.clock() + self.retention
         report.manual_steps = list(MANUAL_STEPS)
@@ -164,19 +187,45 @@ class Revoker:
         }
 
     def _apply(self, report: RevokeReport, add: bool) -> None:
+        """Check every list first, then write them, one failure at a time."""
+        plan: list[tuple[DenyList, Document | None]] = []
         for deny_list in self.deny_lists:
-            current = deny_list.store.read()
-            if deny_list.holds(current, report.user) == add:
+            try:
+                current = deny_list.store.read()
+                edited = None
+                if deny_list.holds(current, report.user) != add:
+                    edit = deny_list.with_user if add else deny_list.without_user
+                    edited = edit(current, report.user)
+                    self._check_size(deny_list, edited)
+            except (LookupError, ValueError, BotoCoreError, ClientError) as error:
+                raise PreflightError(
+                    f"nothing was changed: {deny_list.label}: {error}"
+                ) from error
+            plan.append((deny_list, edited))
+        for deny_list, edited in plan:
+            if edited is None:
                 report.unchanged.append(deny_list.label)
                 continue
-            edit = deny_list.with_user if add else deny_list.without_user
             if not self.dry_run:
-                deny_list.store.write(edit(current, report.user))
+                try:
+                    deny_list.store.write(edited)
+                except (BotoCoreError, ClientError, RuntimeError) as error:
+                    report.failed.append(f"{deny_list.label}: {error}")
+                    continue
             report.changed.append(deny_list.label)
 
-    def _remove_assignments(self, user: User) -> list[str]:
+    @staticmethod
+    def _check_size(deny_list: DenyList, document: Document) -> None:
+        limit = getattr(deny_list.store, "max_size", None)
+        size = len(compact(document))
+        if limit and size > limit:
+            raise ValueError(
+                f"the policy would be {size} characters, over the limit of {limit}"
+            )
+
+    def _remove_assignments(self, user: User, report: RevokeReport) -> None:
         """Delete the user's direct account assignments (not group ones)."""
-        removed = []
+        pending: list[tuple[str, str]] = []
         request = {
             "InstanceArn": self.instance_arn,
             "PrincipalId": user.user_id,
@@ -185,19 +234,61 @@ class Revoker:
         while True:
             page = self.sso_admin.list_account_assignments_for_principal(**request)
             for item in page["AccountAssignments"]:
-                if not self.dry_run:
-                    self.sso_admin.delete_account_assignment(
-                        InstanceArn=self.instance_arn,
-                        TargetId=item["AccountId"],
-                        TargetType="AWS_ACCOUNT",
-                        PermissionSetArn=item["PermissionSetArn"],
-                        PrincipalType="USER",
-                        PrincipalId=user.user_id,
-                    )
-                removed.append(f"{item['AccountId']}/{item['PermissionSetArn']}")
+                label = f"{item['AccountId']}/{item['PermissionSetArn']}"
+                # The listing also returns what the user holds through a group.
+                if item.get("PrincipalType", "USER") != "USER":
+                    report.inherited_assignments.append(label)
+                elif self.dry_run:
+                    report.removed_assignments.append(label)
+                else:
+                    self._delete_assignment(user, item, label, report, pending)
             if "NextToken" not in page:
-                return removed
+                break
             request["NextToken"] = page["NextToken"]
+        for label, request_id in pending:
+            outcome = self._deletion_outcome(request_id)
+            if outcome is None:
+                report.removed_assignments.append(label)
+            else:
+                report.failed.append(f"assignment {label}: {outcome}")
+
+    def _delete_assignment(
+        self,
+        user: User,
+        item: dict[str, Any],
+        label: str,
+        report: RevokeReport,
+        pending: list[tuple[str, str]],
+    ) -> None:
+        try:
+            started = self.sso_admin.delete_account_assignment(
+                InstanceArn=self.instance_arn,
+                TargetId=item["AccountId"],
+                TargetType="AWS_ACCOUNT",
+                PermissionSetArn=item["PermissionSetArn"],
+                PrincipalType="USER",
+                PrincipalId=user.user_id,
+            )
+        except (BotoCoreError, ClientError) as error:
+            report.failed.append(f"assignment {label}: {error}")
+            return
+        pending.append((label, started["AccountAssignmentDeletionStatus"]["RequestId"]))
+
+    def _deletion_outcome(self, request_id: str) -> str | None:
+        """None when the deletion succeeded, otherwise what went wrong."""
+        for attempt in range(self.poll_attempts):
+            status = self.sso_admin.describe_account_assignment_deletion_status(
+                InstanceArn=self.instance_arn,
+                AccountAssignmentDeletionRequestId=request_id,
+            )["AccountAssignmentDeletionStatus"]
+            if status["Status"] == "SUCCEEDED":
+                return None
+            if status["Status"] != "IN_PROGRESS":
+                reason = status.get("FailureReason", "no reason given")
+                return f"{status['Status']}: {reason}"
+            if attempt < self.poll_attempts - 1:
+                self.sleep(self.poll_interval)
+        return "still in progress"
 
     def _group_names(self, user: User) -> list[str]:
         names = []
