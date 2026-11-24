@@ -1,0 +1,35 @@
+[project]
+name = "idc-revoke"
+version = "0.1.0"
+description = "Revoke an IAM Identity Center user through pre-deployed deny lists"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Pierre-Francois Houessou", email = "81161636+hpfpv@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.44.5",
+]
+
+[project.scripts]
+idc-revoke = "idc_revoke.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.5",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=idc_revoke --cov-branch --cov-report=term-missing --cov-fail-under=100"
+filterwarnings = ["error"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]

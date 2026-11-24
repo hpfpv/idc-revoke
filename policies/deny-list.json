@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyRevokedIdentityCenterUsers",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "identitystore:UserId": ["PLACEHOLDER-NOT-A-USER-ID"]
+        }
+      }
+    }
+  ]
+}

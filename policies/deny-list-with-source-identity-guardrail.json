@@ -1,0 +1,53 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyRevokedIdentityCenterUsers",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "identitystore:UserId": ["PLACEHOLDER-NOT-A-USER-ID"]
+        }
+      }
+    },
+    {
+      "Sid": "ChainingRequiresASourceIdentity",
+      "Effect": "Deny",
+      "Action": "sts:AssumeRole",
+      "Resource": "*",
+      "Condition": {
+        "ArnLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*"
+        },
+        "Null": { "sts:SourceIdentity": "true" }
+      }
+    },
+    {
+      "Sid": "SourceIdentityMustBeTheUserName",
+      "Effect": "Deny",
+      "Action": "sts:AssumeRole",
+      "Resource": "*",
+      "Condition": {
+        "ArnLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*"
+        },
+        "StringNotLike": {
+          "aws:userid": "*:${sts:SourceIdentity}"
+        }
+      }
+    },
+    {
+      "Sid": "DenyRevokedSourceIdentities",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceIdentity": ["PLACEHOLDER-NOT-A-USER-NAME"]
+        }
+      }
+    }
+  ]
+}
