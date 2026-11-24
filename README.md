@@ -22,16 +22,25 @@ reported, not removed), and tells you what is left to do by hand.
 It is built to be run under pressure:
 
 - Every list is read and checked before anything is written. A wrong
-  `sid`, a policy that would grow past its size limit or an AWS error
-  stops the run with "nothing was changed".
+  `sid`, an SCP or managed policy that would grow past its size limit,
+  or an AWS error stops the run with "nothing was changed". (There is no
+  size check for an inline policy: AWS refuses it at write time.)
+- Each policy is read again just before it is written, so a change a
+  colleague made in the meantime is kept.
 - If a write then fails, the other policies are still written. The
   report lists what changed and what failed, and the exit code is 1. An
   error later in the run (listing assignments or groups) is added to
   the report, never shown in its place.
 - Several lists in one policy (two statements of one SCP) are written in
   a single update.
-- Running `revoke` again is safe, and reprovisions an inline policy whose
-  first provisioning failed.
+- Running `revoke` again is safe. For an `inline_policy` list it
+  reprovisions the permission set even when there is nothing to change,
+  so a failed first provisioning can be repaired. `restore` does the
+  same.
+- `restore` exits with an error when it finds the user in none of the
+  lists, which is what a mistyped `--user-id` looks like. It refuses an
+  ID that belongs to another username.
+- Interrupting a run (Ctrl-C) prints what was done so far.
 - An assignment counts as removed, and an inline policy as changed, only
   once AWS confirms it.
 
@@ -164,8 +173,10 @@ exactly these actions.
   `organizations:UpdatePolicy`.
 - For a `managed_policy` list, in the account that owns the policy:
   `iam:GetPolicy`, `iam:GetPolicyVersion`, `iam:ListPolicyVersions`,
-  `iam:CreatePolicyVersion`, `iam:DeletePolicyVersion` (and
-  `sts:AssumeRole` if you give a `role_arn`).
+  `iam:CreatePolicyVersion`, `iam:DeletePolicyVersion`. IAM keeps five
+  versions of a policy: when all five exist, the tool deletes the oldest
+  one that is not the default.
+- For any list with a `role_arn`: `sts:AssumeRole` on that role.
 - For an `inline_policy` list: `sso:GetInlinePolicyForPermissionSet`,
   `sso:PutInlinePolicyToPermissionSet`, `sso:ProvisionPermissionSet`,
   `sso:DescribePermissionSetProvisioningStatus`.
@@ -220,7 +231,17 @@ the `profile` or `role_arn` that reaches its account. An account without
 an entry is not covered.
 
 A setting the tool does not know, or a value of the wrong type, stops
-the run: a typo in `remove_assignments` must not go unnoticed.
+the run: a typo in `remove_assignments` must not go unnoticed. A
+`template` must contain `{user_id}` or `{user_name}`: a bare `*` would
+deny everyone the policy covers. Two lists in the same policy must use
+the same `profile`, `role_arn` and `provision`.
+
+With `provision = false`, an inline policy is reported as changed but
+has no effect until you reprovision the permission set yourself.
+
+Put `scp` and `managed_policy` lists before `inline_policy` lists: they
+are written in the order of the file, and an inline policy waits for its
+reprovisioning (up to two minutes) before the next one starts.
 
 ## Use as a module
 
@@ -273,8 +294,12 @@ Only the command line removes them by default.
   in a member account, because the tool does not set a source identity
   on that hop. It fails before changing anything. Run it from the
   management account, or use a `profile` per account.
-- Two people running the tool at the same moment on the same policy can
-  overwrite each other: the last write wins. Run `status` afterwards.
+- Two people writing the same policy within the same second or two can
+  still overwrite each other: the last write wins. Run `status`
+  afterwards.
+- A user already deleted from Identity Center cannot be revoked or
+  checked: `revoke` and `status` look the user up by name. Only
+  `restore` takes `--user-id`. Revoke before you delete.
 - The AWS documentation says the listing of a user's assignments must be
   called from the management account. Running from a delegated
   administrator account was not tested.

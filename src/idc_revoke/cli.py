@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import string
 import sys
 import tomllib
 from collections.abc import Callable
@@ -96,6 +97,30 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ConfigError(f"{key} in deny_list {number} must be text")
         if kind == "inline_policy" and not config.get("instance_arn"):
             raise ConfigError("instance_arn is needed for an inline_policy list")
+        _check_template(entry.get("template", "{user_id}"), number)
+    seen: dict[tuple[str, str], tuple[int, tuple[Any, ...]]] = {}
+    for number, entry in enumerate(entries, start=1):
+        policy = (entry["type"], entry[ENTRY_NEEDS[entry["type"]]])
+        access = tuple(entry.get(key) for key in ("provision", "profile", "role_arn"))
+        first = seen.setdefault(policy, (number, access))
+        if first[1] != access:
+            raise ConfigError(
+                f"deny_list {number} points at the same policy as deny_list "
+                f"{first[0]} with a different provision, profile or role_arn"
+            )
+
+
+def _check_template(template: str, number: int) -> None:
+    """A template with no user field would deny everyone it matches."""
+    try:
+        fields = [name for _, name, _, _ in string.Formatter().parse(template)]
+    except ValueError:
+        fields = [""]
+    named = [name for name in fields if name is not None]
+    if not named or any(name not in ("user_id", "user_name") for name in named):
+        raise ConfigError(
+            f"template in deny_list {number} must use {{user_id}} or {{user_name}}"
+        )
 
 
 class _Sessions:
@@ -227,8 +252,14 @@ def _explain(error: Exception) -> str:
 
 def _run(args: argparse.Namespace) -> Any:
     revoker = build_revoker(load_config(args.config), args.dry_run)
-    if args.command == "revoke":
-        return revoker.revoke(args.user_name).to_dict()
-    if args.command == "restore":
-        return revoker.restore(args.user_name, args.user_id).to_dict()
-    return revoker.status(args.user_name)
+    try:
+        if args.command == "revoke":
+            return revoker.revoke(args.user_name).to_dict()
+        if args.command == "restore":
+            return revoker.restore(args.user_name, args.user_id).to_dict()
+        return revoker.status(args.user_name)
+    except KeyboardInterrupt:
+        # Lists may already be written: show what was done so far.
+        partial = revoker.report.to_dict() if revoker.report else {}
+        partial["failed"] = [*partial.get("failed", []), "interrupted before the end"]
+        return partial

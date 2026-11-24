@@ -480,9 +480,9 @@ def test_a_store_that_needs_it_is_applied_again_when_nothing_changed():
     ids.ensure.assert_called_once_with()
     assert report.unchanged == ["ids/DenyRevoked", "names/DenyRevoked"]
     ids.ensure.side_effect = RuntimeError("provisioning FAILED: boom")
-    assert revoker.revoke("jane").failed == [
-        "ids/DenyRevoked: provisioning FAILED: boom"
-    ]
+    again = revoker.revoke("jane")
+    assert again.failed == ["provisioning ids: provisioning FAILED: boom"]
+    assert again.unchanged == ["names/DenyRevoked"]
 
 
 def test_dry_run_does_not_apply_a_store_again():
@@ -502,3 +502,97 @@ def test_restore_with_an_id_uses_the_stored_user_name_when_the_user_exists():
     report = revoker.restore("JANE", user_id="u-1")
     assert report.user == User("u-1", "jane")
     assert values(names, "aws:userid") == ["PLACEHOLDER"]
+
+
+def test_a_policy_is_read_again_just_before_it_is_written():
+    revoker, ids, _ = make_revoker()
+    someone_else = revoker.deny_lists[0].with_user(ids.document, User("u-2", "bob"))
+    reads = []
+
+    def read():
+        reads.append(1)
+        # A colleague revokes bob between the check and the write.
+        return someone_else if len(reads) > 1 else ids.document
+
+    ids.read = read
+    revoker.revoke("jane")
+    assert values(ids, "identitystore:UserId") == ["PLACEHOLDER", "u-2", "u-1"]
+
+
+def test_three_lists_in_one_policy_with_one_already_holding_the_user():
+    revoker, store = shared_revoker()
+    revoker.deny_lists.append(DenyList(store, "DenyRevokedIdentityCenterUsers"))
+    store.document = revoker.deny_lists[1].with_user(
+        store.document, User("u-1", "jane")
+    )
+    report = revoker.revoke("jane")
+    assert report.changed == [
+        "scp:shared/DenyRevokedIdentityCenterUsers",
+    ]
+    assert len(report.unchanged) == 2
+    assert store.writes == 1
+    assert "u-1" in shared_values(store)[0]
+
+
+def test_restore_that_finds_the_user_nowhere_says_so():
+    revoker, _, _ = make_revoker()
+    report = revoker.restore("jane")
+    assert report.changed == []
+    assert report.failed == ["nothing to restore: the user is in none of the lists"]
+
+
+def test_restore_refuses_an_id_that_belongs_to_someone_else():
+    revoker, ids, _ = make_revoker()
+    revoker.identitystore.describe_user.return_value = {"UserName": "bob"}
+    with pytest.raises(ValueError, match="belongs to bob, not jane"):
+        revoker.restore("jane", user_id="u-2")
+    assert ids.writes == 0
+
+
+def test_restore_does_not_guess_when_the_user_lookup_is_refused():
+    revoker, _, _ = make_revoker()
+    revoker.identitystore.describe_user.side_effect = DENIED
+    with pytest.raises(ClientError):
+        revoker.restore("jane", user_id="u-1")
+
+
+def test_an_unexpected_error_after_the_lists_are_written_keeps_the_report():
+    sso_admin = make_sso_admin()
+    sso_admin.list_account_assignments_for_principal.side_effect = KeyError("x")
+    revoker, _, _ = make_revoker(
+        sso_admin=sso_admin, instance_arn="ins", remove_assignments=True
+    )
+    revoker.identitystore.list_group_memberships_for_member.side_effect = KeyError
+    report = revoker.revoke("jane")
+    assert report.changed == ["ids/DenyRevoked", "names/DenyRevoked"]
+    assert report.failed[0].startswith("removing assignments: ")
+    assert report.failed[1].startswith("listing groups: ")
+    assert revoker.report is report
+
+
+def test_removing_assignments_needs_a_client_and_an_instance():
+    with pytest.raises(ValueError, match="sso_admin and instance_arn"):
+        make_revoker(remove_assignments=True)
+
+
+def test_restore_does_not_check_the_size_of_a_policy_it_shrinks():
+    revoker, ids, names = make_revoker()
+    revoker.revoke("jane")
+    ids.max_size = names.max_size = 10
+    assert len(revoker.restore("jane").changed) == 2
+
+
+def test_a_policy_that_cannot_be_read_again_is_one_failure():
+    revoker, ids, names = make_revoker()
+    document, reads = ids.document, []
+
+    def read():
+        reads.append(1)
+        if len(reads) > 1:
+            raise DENIED
+        return document
+
+    ids.read = read
+    report = revoker.revoke("jane")
+    assert report.failed[0].startswith("ids: ")
+    assert report.changed == ["names/DenyRevoked"]

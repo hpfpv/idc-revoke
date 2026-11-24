@@ -134,6 +134,9 @@ class Revoker:
         self.sleep = sleep
         self.poll_attempts = poll_attempts
         self.poll_interval = poll_interval
+        self.report: RevokeReport | None = None
+        if remove_assignments and (sso_admin is None or not instance_arn):
+            raise ValueError("removing assignments needs sso_admin and instance_arn")
 
     def find_user(self, user_name: str) -> User:
         try:
@@ -159,15 +162,18 @@ class Revoker:
     def revoke(self, user_name: str) -> RevokeReport:
         """Deny the user everywhere, then optionally remove assignments."""
         user = self.find_user(user_name)
-        report = RevokeReport(user, "revoke", self.dry_run)
+        report = self.report = RevokeReport(user, "revoke", self.dry_run)
         self._apply(report, add=True)
         # From here the lists are written: whatever fails, keep the report.
         if self.remove_assignments:
-            self._remove_assignments(user, report)
+            try:
+                self._remove_assignments(user, report)
+            except Exception as error:
+                report.failed.append(f"removing assignments: {error!r}")
         try:
             report.groups = self._group_names(user)
-        except (BotoCoreError, ClientError) as error:
-            report.failed.append(f"listing groups: {error}")
+        except Exception as error:
+            report.failed.append(f"listing groups: {error!r}")
         report.restore_after = self.clock() + self.retention
         report.manual_steps = list(MANUAL_STEPS)
         return report
@@ -178,11 +184,18 @@ class Revoker:
         Pass ``user_id`` when the user has been deleted since the revocation.
         """
         if user_id:
-            user = User(user_id, self._stored_name(user_id) or user_name)
+            stored = self._stored_name(user_id)
+            if stored and stored.lower() != user_name.lower():
+                raise ValueError(
+                    f"user ID {user_id} belongs to {stored}, not {user_name}"
+                )
+            user = User(user_id, stored or user_name)
         else:
             user = self.find_user(user_name)
-        report = RevokeReport(user, "restore", self.dry_run)
+        report = self.report = RevokeReport(user, "restore", self.dry_run)
         self._apply(report, add=False)
+        if not report.changed and not report.failed:
+            report.failed.append("nothing to restore: the user is in none of the lists")
         return report
 
     def _stored_name(self, user_id: str) -> str | None:
@@ -191,8 +204,10 @@ class Revoker:
             described = self.identitystore.describe_user(
                 IdentityStoreId=self.identity_store_id, UserId=user_id
             )
-        except ClientError:
-            return None
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "ResourceNotFoundException":
+                return None
+            raise
         return described.get("UserName")
 
     def status(self, user_name: str) -> dict[str, bool]:
@@ -208,43 +223,79 @@ class Revoker:
 
         Several lists can sit in one policy (two statements of one SCP), so
         the lists are grouped by store: one read, every edit, one write.
+        Each policy is read again just before its write, so a change made
+        by someone else while earlier policies were written is kept.
         """
         stores: dict[str, list[DenyList]] = {}
         for deny_list in self.deny_lists:
             stores.setdefault(deny_list.store.name, []).append(deny_list)
         plan = []
         for deny_lists in stores.values():
-            store, label = deny_lists[0].store, deny_lists[0].store.name
-            touched: list[DenyList] = []
             try:
-                document = store.read()
-                for deny_list in deny_lists:
-                    label = deny_list.label
-                    if deny_list.holds(document, report.user) != add:
-                        edit = deny_list.with_user if add else deny_list.without_user
-                        document = edit(document, report.user)
-                        touched.append(deny_list)
-                if touched:
-                    self._check_size(store, document)
-            except (LookupError, ValueError, BotoCoreError, ClientError) as error:
-                raise PreflightError(
-                    f"nothing was changed: {label}: {error}"
-                ) from error
-            plan.append((store, document, deny_lists, touched))
-        for store, document, deny_lists, touched in plan:
-            untouched = [item.label for item in deny_lists if item not in touched]
-            report.unchanged.extend(untouched)
-            # A store such as an inline policy must be applied again on a
-            # re-run: the document can be right while the roles are not.
-            action = store.write if touched else getattr(store, "ensure", None)
-            labels = [item.label for item in touched] or untouched
-            if action and not self.dry_run:
+                plan.append((deny_lists, self._edit(deny_lists, report.user, add)))
+            except PreflightError as error:
+                raise PreflightError(f"nothing was changed: {error}") from error
+        for deny_lists, (document, touched) in plan:
+            store = deny_lists[0].store
+            ensure = getattr(store, "ensure", None)
+            if not self.dry_run:
                 try:
-                    action(document) if touched else action()
+                    document, touched = self._edit(deny_lists, report.user, add)
+                    if touched:
+                        store.write(document)
+                    elif ensure:
+                        # An inline policy can be right while the roles are
+                        # not: provision again on a re-run.
+                        ensure()
                 except Exception as error:  # one policy must not stop the others
-                    report.failed.extend(f"{label}: {error}" for label in labels)
+                    self._record_failure(report, deny_lists, touched, error)
                     continue
             report.changed.extend(item.label for item in touched)
+            report.unchanged.extend(
+                item.label
+                for item in deny_lists
+                if not any(item is one for one in touched)
+            )
+
+    def _edit(
+        self, deny_lists: list[DenyList], user: User, add: bool
+    ) -> tuple[Document, list[DenyList]]:
+        """Read one policy and apply every edit its lists need."""
+        store, label = deny_lists[0].store, deny_lists[0].store.name
+        touched: list[DenyList] = []
+        try:
+            document = store.read()
+            for deny_list in deny_lists:
+                label = deny_list.label
+                if deny_list.holds(document, user) != add:
+                    edit = deny_list.with_user if add else deny_list.without_user
+                    document = edit(document, user)
+                    touched.append(deny_list)
+            if touched and add:
+                self._check_size(store, document)
+        except (LookupError, ValueError, BotoCoreError, ClientError) as error:
+            raise PreflightError(f"{label}: {error}") from error
+        return document, touched
+
+    @staticmethod
+    def _record_failure(
+        report: RevokeReport,
+        deny_lists: list[DenyList],
+        touched: list[DenyList],
+        error: Exception,
+    ) -> None:
+        if isinstance(error, PreflightError):
+            report.failed.append(str(error))
+        elif touched:
+            report.failed.extend(f"{item.label}: {error}" for item in touched)
+            report.unchanged.extend(
+                item.label
+                for item in deny_lists
+                if not any(item is one for one in touched)
+            )
+        else:
+            name = deny_lists[0].store.name
+            report.failed.append(f"provisioning {name}: {error}")
 
     @staticmethod
     def _check_size(store: DenyListStore, document: Document) -> None:

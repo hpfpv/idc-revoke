@@ -280,6 +280,49 @@ BASE = {
             "provision in deny_list 1 must be true or false",
         ),
         ({"retention_hours": 0}, "retention_hours must be between"),
+        (
+            {
+                "deny_list": [
+                    {"type": "scp", "policy_id": "p", "sid": "s", "template": "*"}
+                ]
+            },
+            "template in deny_list 1 must use",
+        ),
+        (
+            {
+                "deny_list": [
+                    {
+                        "type": "scp",
+                        "policy_id": "p",
+                        "sid": "s",
+                        "template": "{user_id.x}",
+                    }
+                ]
+            },
+            "template in deny_list 1 must use",
+        ),
+        (
+            {
+                "deny_list": [
+                    {
+                        "type": "scp",
+                        "policy_id": "p",
+                        "sid": "s",
+                        "template": "{user_id}{other}",
+                    }
+                ]
+            },
+            "template in deny_list 1 must use",
+        ),
+        (
+            {
+                "deny_list": [
+                    {"type": "scp", "policy_id": "p", "sid": "a"},
+                    {"type": "scp", "policy_id": "p", "sid": "b", "profile": "x"},
+                ]
+            },
+            "deny_list 2 points at the same policy as deny_list 1",
+        ),
         ({"retention_hours": 1e9}, "retention_hours must be between"),
         (
             {
@@ -329,3 +372,36 @@ def test_a_network_error_is_not_blamed_on_the_config_file(
 def test_the_example_configuration_is_accepted():
     example = Path(__file__).parent.parent / "revoke.example.toml"
     cli.validate_config(cli.load_config(example))
+
+
+def test_an_interrupted_run_still_prints_what_was_done(
+    config_file, monkeypatch, capsys
+):
+    revoker = MagicMock()
+    revoker.report = RevokeReport(User("u-1", "jane"), "revoke", False)
+    revoker.report.changed.append("scp:p-1/DenyIds")
+    revoker.revoke.side_effect = KeyboardInterrupt
+    monkeypatch.setattr(cli, "build_revoker", lambda *a, **k: revoker)
+    assert cli.main(["--config", str(config_file), "revoke", "jane"]) == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["changed"] == ["scp:p-1/DenyIds"]
+    assert printed["failed"] == ["interrupted before the end"]
+
+
+def test_an_interruption_before_anything_started_prints_no_report(
+    config_file, monkeypatch, capsys
+):
+    revoker = MagicMock()
+    revoker.report = None
+    revoker.status.side_effect = KeyboardInterrupt
+    monkeypatch.setattr(cli, "build_revoker", lambda *a, **k: revoker)
+    assert cli.main(["--config", str(config_file), "status", "jane"]) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "failed": ["interrupted before the end"]
+    }
+
+
+def test_a_template_with_a_broken_field_is_rejected(sessions):
+    entry = {"type": "scp", "policy_id": "p", "sid": "s", "template": "{user_id"}
+    with pytest.raises(ValueError, match="template in deny_list 1 must use"):
+        cli.build_revoker({**BASE, "deny_list": [entry]}, False, sessions)
