@@ -24,8 +24,14 @@ It is built to be run under pressure:
 - Every list is read and checked before anything is written. A wrong
   `sid`, a policy that would grow past its size limit or an AWS error
   stops the run with "nothing was changed".
-- If a write then fails, the other lists are still written. The report
-  lists what changed and what failed, and the exit code is 1.
+- If a write then fails, the other policies are still written. The
+  report lists what changed and what failed, and the exit code is 1. An
+  error later in the run (listing assignments or groups) is added to
+  the report, never shown in its place.
+- Several lists in one policy (two statements of one SCP) are written in
+  a single update.
+- Running `revoke` again is safe, and reprovisions an inline policy whose
+  first provisioning failed.
 - An assignment counts as removed, and an inline policy as changed, only
   once AWS confirms it.
 
@@ -119,11 +125,11 @@ uv run idc-revoke --config revoke.toml restore jane@example.com
 
 Three things make a first run safe:
 
-- `--dry-run` reads everything and changes nothing. The report shows what
-  it would add to each list.
+- `--dry-run` reads everything and changes nothing. The report shows
+  which lists it would change.
 - `status` only reads: it tells you, list by list, whether the user is in
   it.
-- `restore` puts the lists back the way they were.
+- `restore` takes the user out of every list.
 
 A first test on yourself, in a sandbox:
 
@@ -238,7 +244,13 @@ print(report.restore_after, report.manual_steps)
 ```
 
 A deny list can live anywhere: write a class with a `name` and `read()`
-and `write(document)` methods and pass it as the store.
+and `write(document)` methods and pass it as the store. Two lists in the
+same policy must share the same store name: the policy is then read
+once and written once.
+
+Used as a module, `Revoker` keeps account assignments unless you pass
+`remove_assignments=True` with an `sso_admin` client and `instance_arn`.
+Only the command line removes them by default.
 
 ## What it does not do
 

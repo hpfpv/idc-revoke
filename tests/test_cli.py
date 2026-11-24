@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -261,6 +262,35 @@ BASE = {
         ({"deny_list": [{"type": "scp", "policy_id": "p"}]}, "needs sid"),
         ({"deny_list": ["scp"]}, "deny_list 1 must be a table"),
         ({"identity_store_id": None}, "missing setting: identity_store_id"),
+        (
+            {"deny_list": [{"type": "scp", "policy_id": "p", "sid": "s", "key": 1}]},
+            "key in deny_list 1 must be text",
+        ),
+        (
+            {
+                "deny_list": [
+                    {
+                        "type": "inline_policy",
+                        "permission_set_arn": "ps",
+                        "sid": "s",
+                        "provision": "false",
+                    }
+                ]
+            },
+            "provision in deny_list 1 must be true or false",
+        ),
+        ({"retention_hours": 0}, "retention_hours must be between"),
+        ({"retention_hours": 1e9}, "retention_hours must be between"),
+        (
+            {
+                "remove_assignments": False,
+                "instance_arn": None,
+                "deny_list": [
+                    {"type": "inline_policy", "permission_set_arn": "p", "sid": "s"}
+                ],
+            },
+            "instance_arn is needed",
+        ),
     ],
 )
 def test_mistakes_in_the_configuration_are_rejected(sessions, change, message):
@@ -294,3 +324,8 @@ def test_a_network_error_is_not_blamed_on_the_config_file(
     monkeypatch.setattr(cli, "build_revoker", fail)
     assert cli.main(["--config", str(config_file), "revoke", "jane"]) == 1
     assert capsys.readouterr().err.startswith("idc-revoke: connection reset")
+
+
+def test_the_example_configuration_is_accepted():
+    example = Path(__file__).parent.parent / "revoke.example.toml"
+    cli.validate_config(cli.load_config(example))

@@ -169,3 +169,13 @@ def test_inline_policy_store_reports_provisioning_that_did_not_succeed(
     )
     with pytest.raises(RuntimeError, match=message):
         store.write(DOC)
+
+
+def test_inline_policy_store_can_provision_again_without_writing():
+    client = make_sso()
+    InlinePolicyStore(client, "ins", "ps").ensure()
+    client.put_inline_policy_to_permission_set.assert_not_called()
+    client.provision_permission_set.assert_called_once()
+    quiet = make_sso()
+    InlinePolicyStore(quiet, "ins", "ps", provision=False).ensure()
+    quiet.provision_permission_set.assert_not_called()

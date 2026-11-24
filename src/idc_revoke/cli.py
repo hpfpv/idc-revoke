@@ -69,6 +69,8 @@ def validate_config(config: dict[str, Any]) -> None:
     hours = config.get("retention_hours", 12)
     if isinstance(hours, bool) or not isinstance(hours, int | float):
         raise ConfigError("retention_hours must be a number")
+    if not 0 < hours <= 8760:
+        raise ConfigError("retention_hours must be between 0 and 8760")
     entries = config.get("deny_list")
     if not isinstance(entries, list) or not entries:
         raise ConfigError("the config needs at least one [[deny_list]]")
@@ -84,6 +86,16 @@ def validate_config(config: dict[str, Any]) -> None:
         for needed in ("sid", ENTRY_NEEDS[kind]):
             if not entry.get(needed):
                 raise ConfigError(f"deny_list {number} ({kind}) needs {needed}")
+        for key, value in entry.items():
+            if key == "provision":
+                if not isinstance(value, bool):
+                    raise ConfigError(
+                        f"provision in deny_list {number} must be true or false"
+                    )
+            elif not isinstance(value, str):
+                raise ConfigError(f"{key} in deny_list {number} must be text")
+        if kind == "inline_policy" and not config.get("instance_arn"):
+            raise ConfigError("instance_arn is needed for an inline_policy list")
 
 
 class _Sessions:

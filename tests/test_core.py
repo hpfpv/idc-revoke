@@ -1,4 +1,7 @@
+import copy
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,10 +44,12 @@ def make_identitystore(found=True):
         client.get_user_id.return_value = {"UserId": "u-1"}
         client.describe_user.return_value = {"UserName": "jane"}
     else:
-        client.get_user_id.side_effect = ClientError(
+        gone = ClientError(
             {"Error": {"Code": "ResourceNotFoundException", "Message": "no"}},
             "GetUserId",
         )
+        client.get_user_id.side_effect = gone
+        client.describe_user.side_effect = gone
     client.list_group_memberships_for_member.side_effect = [
         {"GroupMemberships": [{"GroupId": "g-1"}], "NextToken": "t"},
         {"GroupMemberships": [{"GroupId": "g-2"}]},
@@ -350,3 +355,150 @@ def test_an_assignment_counts_as_removed_only_when_the_deletion_succeeds(
     else:
         assert report.removed_assignments == []
         assert report.failed == [expected]
+
+
+DENIED = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "Op")
+GUARDRAIL = (
+    Path(__file__).parent.parent
+    / "policies"
+    / "deny-list-with-source-identity-guardrail.json"
+)
+
+
+class FileStore:
+    """One policy document shared by several deny lists, like a real SCP."""
+
+    name = "scp:shared"
+
+    def __init__(self):
+        self.document = json.loads(GUARDRAIL.read_text())
+        self.writes = 0
+
+    def read(self):
+        return copy.deepcopy(self.document)
+
+    def write(self, document):
+        self.writes += 1
+        self.document = document
+
+
+def shared_revoker(**kwargs):
+    store = FileStore()
+    deny_lists = [
+        DenyList(store, "DenyRevokedIdentityCenterUsers"),
+        DenyList(
+            store,
+            "DenyRevokedSourceIdentities",
+            key="aws:SourceIdentity",
+            template="{user_name}",
+        ),
+    ]
+    revoker = Revoker(
+        identitystore=make_identitystore(),
+        identity_store_id="d-1",
+        deny_lists=deny_lists,
+        clock=lambda: NOW,
+        **kwargs,
+    )
+    return revoker, store
+
+
+def shared_values(store):
+    first, last = store.document["Statement"][0], store.document["Statement"][-1]
+    return (
+        first["Condition"]["StringEquals"]["identitystore:UserId"],
+        last["Condition"]["StringEquals"]["aws:SourceIdentity"],
+    )
+
+
+def test_two_lists_in_the_same_policy_are_both_written_in_one_write():
+    revoker, store = shared_revoker()
+    report = revoker.revoke("jane")
+    ids, names = shared_values(store)
+    assert "u-1" in ids
+    assert "jane" in names
+    assert store.writes == 1
+    assert len(report.changed) == 2
+    assert revoker.status("jane") == dict.fromkeys(report.changed, True)
+
+
+def test_restore_empties_two_lists_in_the_same_policy():
+    revoker, store = shared_revoker()
+    revoker.revoke("jane")
+    report = revoker.restore("jane")
+    ids, names = shared_values(store)
+    assert "u-1" not in ids
+    assert "jane" not in names
+    assert len(report.changed) == 2
+    assert store.writes == 2
+
+
+def test_a_write_that_breaks_in_an_unexpected_way_is_still_only_one_failure():
+    revoker, ids, names = make_revoker()
+    ids.write = MagicMock(side_effect=KeyError("Versions"))
+    report = revoker.revoke("jane")
+    assert report.changed == ["names/DenyRevoked"]
+    assert report.failed[0].startswith("ids/DenyRevoked: ")
+
+
+def test_an_error_after_the_lists_are_written_keeps_the_report():
+    sso_admin = make_sso_admin()
+    sso_admin.list_account_assignments_for_principal.side_effect = DENIED
+    revoker, _, _ = make_revoker(
+        sso_admin=sso_admin, instance_arn="ins", remove_assignments=True
+    )
+    revoker.identitystore.list_group_memberships_for_member.side_effect = DENIED
+    report = revoker.revoke("jane")
+    assert report.changed == ["ids/DenyRevoked", "names/DenyRevoked"]
+    assert report.failed[0].startswith("listing assignments: ")
+    assert report.failed[1].startswith("listing groups: ")
+    assert report.restore_after is not None
+    assert report.manual_steps
+
+
+def test_an_error_while_checking_a_deletion_does_not_lose_the_others():
+    sso_admin = make_sso_admin()
+    sso_admin.describe_account_assignment_deletion_status.side_effect = [
+        DENIED,
+        {"AccountAssignmentDeletionStatus": {"Status": "SUCCEEDED"}},
+    ]
+    revoker, _, _ = make_revoker(
+        sso_admin=sso_admin, instance_arn="ins", remove_assignments=True
+    )
+    report = revoker.revoke("jane")
+    assert report.removed_assignments == ["222/ps-b"]
+    assert report.failed[0].startswith("assignment 111/ps-a: ")
+
+
+def test_a_store_that_needs_it_is_applied_again_when_nothing_changed():
+    revoker, ids, _ = make_revoker()
+    groups = revoker.identitystore.list_group_memberships_for_member
+    groups.side_effect = lambda **kw: {"GroupMemberships": []}
+    revoker.revoke("jane")
+    ids.ensure = MagicMock()
+    report = revoker.revoke("jane")
+    ids.ensure.assert_called_once_with()
+    assert report.unchanged == ["ids/DenyRevoked", "names/DenyRevoked"]
+    ids.ensure.side_effect = RuntimeError("provisioning FAILED: boom")
+    assert revoker.revoke("jane").failed == [
+        "ids/DenyRevoked: provisioning FAILED: boom"
+    ]
+
+
+def test_dry_run_does_not_apply_a_store_again():
+    revoker, ids, _ = make_revoker()
+    groups = revoker.identitystore.list_group_memberships_for_member
+    groups.side_effect = lambda **kw: {"GroupMemberships": []}
+    revoker.revoke("jane")
+    ids.ensure = MagicMock()
+    revoker.dry_run = True
+    revoker.revoke("jane")
+    ids.ensure.assert_not_called()
+
+
+def test_restore_with_an_id_uses_the_stored_user_name_when_the_user_exists():
+    revoker, _, names = make_revoker()
+    revoker.revoke("jane")
+    report = revoker.restore("JANE", user_id="u-1")
+    assert report.user == User("u-1", "jane")
+    assert values(names, "aws:userid") == ["PLACEHOLDER"]

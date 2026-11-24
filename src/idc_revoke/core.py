@@ -161,9 +161,13 @@ class Revoker:
         user = self.find_user(user_name)
         report = RevokeReport(user, "revoke", self.dry_run)
         self._apply(report, add=True)
+        # From here the lists are written: whatever fails, keep the report.
         if self.remove_assignments:
             self._remove_assignments(user, report)
-        report.groups = self._group_names(user)
+        try:
+            report.groups = self._group_names(user)
+        except (BotoCoreError, ClientError) as error:
+            report.failed.append(f"listing groups: {error}")
         report.restore_after = self.clock() + self.retention
         report.manual_steps = list(MANUAL_STEPS)
         return report
@@ -173,10 +177,23 @@ class Revoker:
 
         Pass ``user_id`` when the user has been deleted since the revocation.
         """
-        user = User(user_id, user_name) if user_id else self.find_user(user_name)
+        if user_id:
+            user = User(user_id, self._stored_name(user_id) or user_name)
+        else:
+            user = self.find_user(user_name)
         report = RevokeReport(user, "restore", self.dry_run)
         self._apply(report, add=False)
         return report
+
+    def _stored_name(self, user_id: str) -> str | None:
+        """The user name Identity Center holds, if the user still exists."""
+        try:
+            described = self.identitystore.describe_user(
+                IdentityStoreId=self.identity_store_id, UserId=user_id
+            )
+        except ClientError:
+            return None
+        return described.get("UserName")
 
     def status(self, user_name: str) -> dict[str, bool]:
         """Say, for each deny list, whether the user is in it."""
@@ -187,36 +204,51 @@ class Revoker:
         }
 
     def _apply(self, report: RevokeReport, add: bool) -> None:
-        """Check every list first, then write them, one failure at a time."""
-        plan: list[tuple[DenyList, Document | None]] = []
+        """Check every policy first, then write each one once.
+
+        Several lists can sit in one policy (two statements of one SCP), so
+        the lists are grouped by store: one read, every edit, one write.
+        """
+        stores: dict[str, list[DenyList]] = {}
         for deny_list in self.deny_lists:
+            stores.setdefault(deny_list.store.name, []).append(deny_list)
+        plan = []
+        for deny_lists in stores.values():
+            store, label = deny_lists[0].store, deny_lists[0].store.name
+            touched: list[DenyList] = []
             try:
-                current = deny_list.store.read()
-                edited = None
-                if deny_list.holds(current, report.user) != add:
-                    edit = deny_list.with_user if add else deny_list.without_user
-                    edited = edit(current, report.user)
-                    self._check_size(deny_list, edited)
+                document = store.read()
+                for deny_list in deny_lists:
+                    label = deny_list.label
+                    if deny_list.holds(document, report.user) != add:
+                        edit = deny_list.with_user if add else deny_list.without_user
+                        document = edit(document, report.user)
+                        touched.append(deny_list)
+                if touched:
+                    self._check_size(store, document)
             except (LookupError, ValueError, BotoCoreError, ClientError) as error:
                 raise PreflightError(
-                    f"nothing was changed: {deny_list.label}: {error}"
+                    f"nothing was changed: {label}: {error}"
                 ) from error
-            plan.append((deny_list, edited))
-        for deny_list, edited in plan:
-            if edited is None:
-                report.unchanged.append(deny_list.label)
-                continue
-            if not self.dry_run:
+            plan.append((store, document, deny_lists, touched))
+        for store, document, deny_lists, touched in plan:
+            untouched = [item.label for item in deny_lists if item not in touched]
+            report.unchanged.extend(untouched)
+            # A store such as an inline policy must be applied again on a
+            # re-run: the document can be right while the roles are not.
+            action = store.write if touched else getattr(store, "ensure", None)
+            labels = [item.label for item in touched] or untouched
+            if action and not self.dry_run:
                 try:
-                    deny_list.store.write(edited)
-                except (BotoCoreError, ClientError, RuntimeError) as error:
-                    report.failed.append(f"{deny_list.label}: {error}")
+                    action(document) if touched else action()
+                except Exception as error:  # one policy must not stop the others
+                    report.failed.extend(f"{label}: {error}" for label in labels)
                     continue
-            report.changed.append(deny_list.label)
+            report.changed.extend(item.label for item in touched)
 
     @staticmethod
-    def _check_size(deny_list: DenyList, document: Document) -> None:
-        limit = getattr(deny_list.store, "max_size", None)
+    def _check_size(store: DenyListStore, document: Document) -> None:
+        limit = getattr(store, "max_size", None)
         size = len(compact(document))
         if limit and size > limit:
             raise ValueError(
@@ -231,22 +263,28 @@ class Revoker:
             "PrincipalId": user.user_id,
             "PrincipalType": "USER",
         }
-        while True:
-            page = self.sso_admin.list_account_assignments_for_principal(**request)
-            for item in page["AccountAssignments"]:
-                label = f"{item['AccountId']}/{item['PermissionSetArn']}"
-                # The listing also returns what the user holds through a group.
-                if item.get("PrincipalType", "USER") != "USER":
-                    report.inherited_assignments.append(label)
-                elif self.dry_run:
-                    report.removed_assignments.append(label)
-                else:
-                    self._delete_assignment(user, item, label, report, pending)
-            if "NextToken" not in page:
-                break
-            request["NextToken"] = page["NextToken"]
+        try:
+            while True:
+                page = self.sso_admin.list_account_assignments_for_principal(**request)
+                for item in page["AccountAssignments"]:
+                    label = f"{item['AccountId']}/{item['PermissionSetArn']}"
+                    # The listing also returns what is held through a group.
+                    if item.get("PrincipalType", "USER") != "USER":
+                        report.inherited_assignments.append(label)
+                    elif self.dry_run:
+                        report.removed_assignments.append(label)
+                    else:
+                        self._delete_assignment(user, item, label, report, pending)
+                if "NextToken" not in page:
+                    break
+                request["NextToken"] = page["NextToken"]
+        except (BotoCoreError, ClientError) as error:
+            report.failed.append(f"listing assignments: {error}")
         for label, request_id in pending:
-            outcome = self._deletion_outcome(request_id)
+            try:
+                outcome = self._deletion_outcome(request_id)
+            except (BotoCoreError, ClientError) as error:
+                outcome = str(error)
             if outcome is None:
                 report.removed_assignments.append(label)
             else:

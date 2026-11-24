@@ -130,6 +130,10 @@ class InlinePolicyStore:
             PermissionSetArn=self.permission_set_arn,
             InlinePolicy=compact(document),
         )
+        self.ensure()
+
+    def ensure(self) -> None:
+        """Provision the permission set and wait until its roles are updated."""
         if not self.provision:
             return
         started = self.client.provision_permission_set(

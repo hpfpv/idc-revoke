@@ -13,6 +13,9 @@ dependencies = [
     "boto3>=1.44.5",
 ]
 
+[project.urls]
+Repository = "https://github.com/hpfpv/idc-revoke"
+
 [project.scripts]
 idc-revoke = "idc_revoke.cli:main"
 
